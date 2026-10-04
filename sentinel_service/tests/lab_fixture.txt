@@ -1,0 +1,25 @@
+import sqlite3
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+app = FastAPI()
+@app.get('/health')
+def health():
+    return {'status': 'ok'}
+@app.get('/products')
+def search_product(q: str = 'Laptop'):
+    db = sqlite3.connect(':memory:')
+    try:
+        db.execute('CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT, price INTEGER)')
+        db.executemany('INSERT INTO products VALUES (?, ?, ?)', [(1, 'Laptop', 50000), (2, 'Keyboard', 1500), (3, 'Mouse', 500)])
+        query = (
+            "SELECT id, name, price FROM products "
+            "WHERE name = '" + q + "'"
+        )
+        print('SQL executed:', query)
+        cursor = db.execute(query)
+        rows = cursor.fetchall()
+        return {'products': [{'id': r[0], 'name': r[1], 'price': r[2]} for r in rows]}
+    except sqlite3.Error:
+        return JSONResponse(status_code=400, content={'message': 'Invalid SQL query'})
+    finally:
+        db.close()

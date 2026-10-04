@@ -1,0 +1,9 @@
+**/venv/
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/.env
+**/app_logs.txt
+**/.pytest_cache/
+**/data/*.db
+**/repair-runs/

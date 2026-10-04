@@ -1,0 +1,139 @@
+--- /mnt/data/sentinel_src/team-b-sentinel-five-agents/sentinel/core.py	2026-09-22 16:27:47.000000000 +0000
++++ /mnt/data/Self-Healing-Security-SRE-Merged/sentinel_service/sentinel/core.py	2026-10-03 13:08:55.807836698 +0000
+@@ -161,9 +161,10 @@
+ 
+ 
+ class Engine:
+-    def __init__(self, store: Store, cfg: Settings, health=None, repairer=None):
++    def __init__(self, store: Store, cfg: Settings, health=None, repairer=None, incident_sink=None):
+         self.store, self.cfg, self.health = store, cfg, health
+         self.repairer = repairer
++        self.incident_sink = incident_sink
+         self.monitor_state = {"healthy": None, "checked_at": None, "active_rules": 0}
+         self.agent_activity = {name: {"runs": 0, "last_at": None, "last_outcome": "Waiting"} for name in ("Boss Agent", "Detection Agent", "SOC Analyst Agent", "Repair Agent", "Monitor Agent")}
+         self.sources = OrderedDict()
+@@ -370,7 +371,25 @@
+                 d['status'] = 'repaired' if d.get('source_repair', {}).get('status') == 'repaired' else 'mitigated'
+             elif d['status'] != 'rolled_back':
+                 d['status'] = 'escalated'
+-            d['completed'] = time.time(); d['duration_ms'] = round((d['completed']-d['created'])*1000, 1)
++            d['sentinel_completed'] = time.time()
++            d['sentinel_duration_ms'] = round((d['sentinel_completed']-d['created'])*1000, 1)
++
++            # Hand structured incidents to the SRE remediation service only after
++            # Sentinel has made and verified its bounded containment decision.
++            if self.incident_sink is not None:
++                try:
++                    d['sre_remediation'] = await self.incident_sink(dict(d))
++                except Exception as exc:
++                    d['sre_remediation'] = {
++                        'status': 'bridge_failed',
++                        'error_type': type(exc).__name__,
++                        'note': 'Sentinel containment remains active; SRE handoff can be retried after the bridge is restored.'
++                    }
++            else:
++                d['sre_remediation'] = {'status': 'bridge_disabled'}
++
++            d['completed'] = time.time()
++            d['duration_ms'] = round((d['completed']-d['created'])*1000, 1)
+             self.trace(d, 'Record', d['status'])
+             return {'incident': d}
+ 
+@@ -489,7 +508,7 @@
+                 incident['status'] = 'expired'
+         return {**d, 'metrics': self.metrics, 'started': self.started, 'queue_depth': self.queue.qsize(),
+                 'agents': self.agent_activity, 'monitor': self.monitor_state, 'orchestrator': 'LangGraph',
+-                'source_repair_enabled': self.repairer is not None, 'enabled_attacks': ['sql_injection', 'brute_force'] + (['http_flood'] if self.cfg.http_flood_enabled else []),
++                'source_repair_enabled': self.repairer is not None, 'sre_bridge_enabled': self.incident_sink is not None, 'enabled_attacks': ['sql_injection', 'brute_force'] + (['http_flood'] if self.cfg.http_flood_enabled else []),
+                 'mode': 'live', 'llm_enabled': bool(self.cfg.llm_model), 'thresholds': {
+                     'ip_requests': self.cfg.ip_limit, 'global_requests': self.cfg.global_limit,
+                     'flood_window': self.cfg.flood_window, 'failed_logins': self.cfg.login_limit,
+--- /mnt/data/sentinel_src/team-b-sentinel-five-agents/start.py	2026-09-22 16:27:46.000000000 +0000
++++ /mnt/data/Self-Healing-Security-SRE-Merged/sentinel_service/start.py	2026-10-03 13:13:44.889935192 +0000
+@@ -43,7 +43,17 @@
+             user=os.getenv('KALI_USER', 'kali'), port=kali_port)
+         await asyncio.to_thread(repairer.connect, lambda: getpass.getpass('Kali SSH password (hidden): '))
+         print('Kali executor ready. All five LangGraph agents run in Windows.')
+-    engine = Engine(Store(str(ROOT/'data'/'sentinel.db')), cfg, repairer=repairer)
++    incident_sink = None
++    if os.getenv('SRE_BRIDGE_ENABLED', 'false').lower() == 'true':
++        from sentinel.sre_bridge import SREBridge
++        incident_sink = SREBridge(
++            os.getenv('SRE_BRIDGE_URL', 'http://127.0.0.1:8101'),
++            os.environ['SRE_BRIDGE_TOKEN'],
++            timeout_seconds=float(os.getenv('SRE_BRIDGE_TIMEOUT', '180')),
++        )
++        print('SRE remediation bridge enabled.')
++
++    engine = Engine(Store(str(ROOT/'data'/'sentinel.db')), cfg, repairer=repairer, incident_sink=incident_sink)
+     origins = [x.strip() for x in os.getenv('ALLOWED_ORIGINS','').split(',') if x.strip()]
+     management, gateway = create_apps(engine, os.getenv('UPSTREAM_URL','http://127.0.0.1:9000'),
+         os.getenv('ADMIN_TOKEN',''), os.getenv('COLLECTOR_TOKEN',''), ROOT/'website', origins)
+@@ -51,7 +61,22 @@
+                Server(uvicorn.Config(gateway,host=os.getenv('GATEWAY_HOST','127.0.0.1'),port=8080,
+                                              proxy_headers=False,access_log=False,limit_concurrency=100))]
+     if os.getenv('START_LAB','true').lower() == 'true':
+-        from lab_app import app
++        lab_mode = os.getenv('LOCAL_LAB_MODE', 'safe').lower()
++        if lab_mode == 'unsafe':
++            # Local-loopback learning mode only. The intentionally vulnerable app
++            # is the same source file inspected by the SRE remediation service.
++            import importlib.util
++            lab_path = ROOT / 'kali_lab' / 'unsafe_demo.py'
++            spec = importlib.util.spec_from_file_location('sentinel_local_unsafe_demo', lab_path)
++            module = importlib.util.module_from_spec(spec)
++            spec.loader.exec_module(module)
++            app = module.app
++            print('Local lab mode: UNSAFE learning fixture behind Sentinel gateway.')
++        elif lab_mode == 'safe':
++            from lab_app import app
++            print('Local lab mode: safe parameterized-SQL fixture.')
++        else:
++            raise ValueError("LOCAL_LAB_MODE must be 'safe' or 'unsafe'")
+         servers.append(Server(uvicorn.Config(app,host='127.0.0.1',port=9000,proxy_headers=False,access_log=False)))
+     def stop(signum, frame):
+         for server in servers:
+--- /mnt/data/sentinel_src/team-b-sentinel-five-agents/website/app.js	2026-09-22 16:27:47.000000000 +0000
++++ /mnt/data/Self-Healing-Security-SRE-Merged/sentinel_service/website/app.js	2026-10-03 13:08:55.808170994 +0000
+@@ -55,7 +55,7 @@
+  document.querySelectorAll('[data-id]').forEach(b=>b.onclick=()=>{selected=b.dataset.id;render();});
+  const i=snapshot.incidents.find(i=>i.id===selected);if(!i){$('detail').innerHTML=initialDetail;return;}
+  const rule=snapshot.rules.find(r=>r.id===i.rule_id);
+- $('detail').innerHTML=`<div class="detail-top"><span class="eyebrow">${mode==='demo'?'SAMPLE INCIDENT':'INCIDENT DETAILS'}</span><span class="status">${esc(i.status.replaceAll('_',' '))}</span></div><h2>${esc(labels[i.label]||i.label)}</h2><p>${esc(i.explanation)}</p><div class="facts"><div><small>Source</small>${esc(i.source_ip)}</div><div><small>Protected route</small>${esc(i.path)}</div><div><small>Evidence source</small>${esc(i.origin)}</div><div><small>Local LLM</small>${esc(i.llm_status)}</div></div><div class="evidence">${esc(JSON.stringify(i.evidence,null,2))}</div><h3>Five-agent decision trail</h3><ol class="trace">${(i.trace||[]).map((t,n)=>`<li><b>${String(n+1).padStart(2,'0')}</b><div>${esc(t.node)}<small>${esc(t.outcome)}</small></div></li>`).join('')}</ol>${i.source_repair?`<details open><summary>Source repair result · ${esc(i.source_repair.status)}</summary><pre>${esc(JSON.stringify(i.source_repair,null,2))}</pre></details>`:''}${i.verification?`<p>${esc(i.verification.scope)}</p>`:''}${i.llm_note?`<details><summary>Model explanation · advisory</summary><p>${esc(i.llm_note)}</p></details>`:''}${i.patch?`<details><summary>SQL source action · ${esc(i.patch.status)}</summary><p>${esc(i.patch.title)}</p><pre>${esc(i.patch.example)}</pre><p>${esc(i.patch.note)}</p></details>`:''}<div class="detail-actions">${rule?'<button id="rollback">'+(mode==='demo'?'Simulate rollback':'Roll back protection')+'</button>':''}<button id="export">Export incident JSON</button></div>${rule?`<p>Rule expires ${new Date(rule.expires*1000).toLocaleTimeString()}. ${mode==='demo'?'Sample expiry; no server rule exists.':''}</p>`:''}`;
++ $('detail').innerHTML=`<div class="detail-top"><span class="eyebrow">${mode==='demo'?'SAMPLE INCIDENT':'INCIDENT DETAILS'}</span><span class="status">${esc(i.status.replaceAll('_',' '))}</span></div><h2>${esc(labels[i.label]||i.label)}</h2><p>${esc(i.explanation)}</p><div class="facts"><div><small>Source</small>${esc(i.source_ip)}</div><div><small>Protected route</small>${esc(i.path)}</div><div><small>Evidence source</small>${esc(i.origin)}</div><div><small>Local LLM</small>${esc(i.llm_status)}</div></div><div class="evidence">${esc(JSON.stringify(i.evidence,null,2))}</div><h3>Five-agent decision trail</h3><ol class="trace">${(i.trace||[]).map((t,n)=>`<li><b>${String(n+1).padStart(2,'0')}</b><div>${esc(t.node)}<small>${esc(t.outcome)}</small></div></li>`).join('')}</ol>${i.source_repair?`<details open><summary>Source repair result · ${esc(i.source_repair.status)}</summary><pre>${esc(JSON.stringify(i.source_repair,null,2))}</pre></details>`:''}${i.sre_remediation?`<details open><summary>SRE remediation · ${esc(i.sre_remediation.status)}</summary><pre>${esc(JSON.stringify(i.sre_remediation,null,2))}</pre></details>`:''}${i.verification?`<p>${esc(i.verification.scope)}</p>`:''}${i.llm_note?`<details><summary>Model explanation · advisory</summary><p>${esc(i.llm_note)}</p></details>`:''}${i.patch?`<details><summary>SQL source action · ${esc(i.patch.status)}</summary><p>${esc(i.patch.title)}</p><pre>${esc(i.patch.example)}</pre><p>${esc(i.patch.note)}</p></details>`:''}<div class="detail-actions">${rule?'<button id="rollback">'+(mode==='demo'?'Simulate rollback':'Roll back protection')+'</button>':''}<button id="export">Export incident JSON</button></div>${rule?`<p>Rule expires ${new Date(rule.expires*1000).toLocaleTimeString()}. ${mode==='demo'?'Sample expiry; no server rule exists.':''}</p>`:''}`;
+  if($('rollback'))$('rollback').onclick=async()=>{
+   if(mode==='disconnected'){message('Reconnect before changing a protection.');return;}
+   if(mode==='demo'){snapshot.rules=snapshot.rules.filter(r=>r.id!==i.rule_id);i.status='rolled_back';i.trace.push({node:'Rollback',outcome:'Sample rule removed locally'});render();message('Demo rollback complete. No real protection was changed.');return;}
+--- /mnt/data/sentinel_src/team-b-sentinel-five-agents/.env.example	2026-09-22 16:27:46.000000000 +0000
++++ /mnt/data/Self-Healing-Security-SRE-Merged/sentinel_service/.env.example	2026-10-03 13:13:44.890046771 +0000
+@@ -1,6 +1,7 @@
+ ADMIN_TOKEN=GENERATE_ADMIN_TOKEN
+ COLLECTOR_TOKEN=GENERATE_COLLECTOR_TOKEN
+ START_LAB=true
++LOCAL_LAB_MODE=safe
+ UPSTREAM_URL=http://127.0.0.1:9000
+ GATEWAY_HOST=127.0.0.1
+ AUTO_SQL_REPAIR=false
+@@ -17,3 +18,9 @@
+ OLLAMA_MODEL=
+ OLLAMA_URL=http://127.0.0.1:11434
+ ALLOWED_ORIGINS=
++
++# SRE remediation bridge (same token must be used in sre_service/.env)
++SRE_BRIDGE_ENABLED=true
++SRE_BRIDGE_URL=http://127.0.0.1:8101
++SRE_BRIDGE_TOKEN=GENERATE_SHARED_BRIDGE_TOKEN
++SRE_BRIDGE_TIMEOUT=180
+--- /mnt/data/sre_src/Self-Healing-SRE-Agent-main/.env.example	2026-02-28 22:24:48.000000000 +0000
++++ /mnt/data/Self-Healing-Security-SRE-Merged/sre_service/.env.example	2026-10-03 13:08:55.949069408 +0000
+@@ -30,3 +30,10 @@
+ LANGCHAIN_TRACING_V2=false
+ LANGCHAIN_API_KEY=
+ LANGCHAIN_PROJECT=sre-agent
++
++# --- Sentinel -> SRE security remediation bridge ---
++SECURITY_API_PORT=8101
++BRIDGE_TOKEN=GENERATE_SHARED_BRIDGE_TOKEN
++# Local source used by the defensive demo. Keep the repo path aligned with your GitHub repository layout.
++SECURITY_TARGET_FILE=../sentinel_service/kali_lab/unsafe_demo.py
++SECURITY_TARGET_REPO_PATH=sentinel_service/kali_lab/unsafe_demo.py

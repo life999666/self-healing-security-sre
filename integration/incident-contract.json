@@ -1,0 +1,16 @@
+{
+  "incident_id": "uuid-from-sentinel",
+  "label": "sql_injection",
+  "source_ip": "192.0.2.10",
+  "path": "/products",
+  "evidence": {
+    "signature": "SQL-02",
+    "request_fingerprint": "redacted-hash"
+  },
+  "explanation": "Sentinel explanation",
+  "sentinel_status": "mitigated",
+  "origin": "gateway",
+  "created": 0,
+  "completed": 0,
+  "sentinel_duration_ms": 0
+}
